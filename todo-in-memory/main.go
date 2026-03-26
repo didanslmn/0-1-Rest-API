@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,21 +13,44 @@ import (
 
 // Struct
 
+// konstanta priority agar tidak typo saat validasi
+type Priority string
+
+const (
+	PriorityLow    Priority = "low"
+	PriorityMedium Priority = "medium"
+	PriorityHigh   Priority = "high"
+)
+
+func isValidPriority(p Priority) bool {
+	return p == PriorityLow || p == PriorityMedium || p == PriorityHigh
+}
+
 type Todo struct {
 	ID        int       `json:"id"`
 	Title     string    `json:"title"`
 	Completed bool      `json:"completed"`
+	Priority  Priority  `json:"priority"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type CreateTodoRequest struct {
-	Title string `json:"title"`
+	Title    string   `json:"title"`
+	Priority Priority `json:"priority"`
 }
 
 type UpdateTodoRequest struct {
-	Title     *string `json:"title"`
-	Completed *bool   `json:"completed"`
+	Title     *string   `json:"title"`
+	Completed *bool     `json:"completed"`
+	Priority  *Priority `json:"priority"`
+}
+
+type Stats struct {
+	Total      int            `json:"total"`
+	Completed  int            `json:"completed"`
+	Pending    int            `json:"pending"`
+	ByPriority map[string]int `json:"by_priority"`
 }
 
 type Response struct {
@@ -49,15 +73,24 @@ var store = &TodoStore{
 	todos: make(map[int]Todo),
 }
 
-// read todo
-func (s *TodoStore) GetAll() []Todo {
+// read todo , filter completed + sorting by id
+func (s *TodoStore) GetAll(filterCompleted *bool) []Todo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	list := make([]Todo, 0, len(s.todos))
 	for _, task := range s.todos {
+		// filter
+		if filterCompleted != nil && task.Completed != *filterCompleted {
+			continue
+		}
 		list = append(list, task)
 	}
+	// sort perdasarkan id
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].ID < list[j].ID
+	})
+
 	return list
 
 }
@@ -71,7 +104,7 @@ func (s *TodoStore) GetByID(id int) (Todo, bool) {
 	return todo, ok
 }
 
-func (s *TodoStore) Create(title string) Todo {
+func (s *TodoStore) Create(title string, priority Priority) Todo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -83,6 +116,7 @@ func (s *TodoStore) Create(title string) Todo {
 		ID:        id,
 		Title:     title,
 		Completed: false,
+		Priority:  priority,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -109,6 +143,9 @@ func (s *TodoStore) Update(id int, req UpdateTodoRequest) (Todo, bool) {
 	if req.Completed != nil {
 		todo.Completed = *req.Completed
 	}
+	if req.Priority != nil {
+		todo.Priority = *req.Priority
+	}
 
 	todo.UpdatedAt = time.Now()
 	// simpan kembali ke map
@@ -129,6 +166,31 @@ func (s *TodoStore) Delete(id int) bool {
 
 	delete(s.todos, id)
 	return true
+}
+
+func (s *TodoStore) GetStats() Stats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// inisialisasi stats
+	stats := Stats{
+		ByPriority: map[string]int{
+			string(PriorityLow):    0,
+			string(PriorityMedium): 0,
+			string(PriorityHigh):   0,
+		},
+	}
+	// hitung stats
+	for _, t := range s.todos {
+		stats.Total++
+		if t.Completed {
+			stats.Completed++
+		} else {
+			stats.Pending++
+		}
+		stats.ByPriority[string(t.Priority)]++
+	}
+	return stats
 }
 
 // helper
@@ -168,7 +230,17 @@ func todosHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	// GET /todos -> ambil semua todo
 	case http.MethodGet:
-		todos := store.GetAll()
+		// filter opsional berdasarkan completed
+		var filterComleted *bool
+		if raw := r.URL.Query().Get("completed"); raw != "" {
+			val, err := strconv.ParseBool(raw)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "parameter 'completed' harus true atau false")
+				return
+			}
+			filterComleted = &val
+		}
+		todos := store.GetAll(filterComleted)
 		// kalau kosong kembalikan array kosong bukan null
 		if todos == nil {
 			todos = []Todo{}
@@ -190,7 +262,7 @@ func todosHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		todo := store.Create(strings.TrimSpace(req.Title))
+		todo := store.Create(strings.TrimSpace(req.Title), req.Priority)
 
 		writeJSON(w, http.StatusOK, Response{
 			Success: true,
@@ -207,6 +279,10 @@ func todosHandler(w http.ResponseWriter, r *http.Request) {
 // todoByIDHandler menangani /todos/{id} -> GET,PUT,DELETE
 
 func todoByIDHandler(w http.ResponseWriter, r *http.Request) {
+	// if r.URL.Path == "/todos/stats" {
+	// 	statsHandler(w, r)
+	// 	return
+	// }
 	id, ok := extractID(r.URL.Path)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "ID tidak valid")
@@ -246,6 +322,10 @@ func todoByIDHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "filed title tidak boleh kosong")
 			return
 		}
+		if req.Priority == nil && !isValidPriority(*req.Priority) {
+			writeError(w, http.StatusBadRequest, "field priority harus bernilai : low/medium/high")
+			return
+		}
 
 		todo, found := store.Update(id, req)
 		if !found {
@@ -274,6 +354,20 @@ func todoByIDHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// statsHandler menangani GET /todos/stats
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "hanya mendukung method Get")
+		return
+	}
+	stats := store.GetStats()
+	writeJSON(w, http.StatusOK, Response{
+		Success: true,
+		Data:    stats,
+	})
+}
+
 // mainRouter memisahkan /todos dan /todos{id}
 
 func mainRouter(w http.ResponseWriter, r *http.Request) {
@@ -285,6 +379,8 @@ func mainRouter(w http.ResponseWriter, r *http.Request) {
 		todosHandler(w, r)
 	case len(parts) == 2 && parts[0] == "todos":
 		todoByIDHandler(w, r)
+	case path == "todos/stats":
+		statsHandler(w, r)
 	default:
 		writeError(w, http.StatusNotFound, "endpoint tidak ditemukan")
 	}
@@ -295,6 +391,7 @@ func mainRouter(w http.ResponseWriter, r *http.Request) {
 func main() {
 	http.HandleFunc("/todos", todosHandler)
 	http.HandleFunc("/todos/", todoByIDHandler)
+	http.HandleFunc("/todos/stats", statsHandler)
 
 	port := ":8080"
 	log.Printf("server berjalan di http://localhost:%s", port)
@@ -304,5 +401,6 @@ func main() {
 	log.Printf("  GET    /todos/{id}   → ambil satu todo")
 	log.Printf("  PUT    /todos/{id}   → update todo")
 	log.Printf("  DELETE /todos/{id}   → hapus todo")
+	log.Printf("  GET    /todos/stats  → ambil statistik todo")
 	log.Fatal(http.ListenAndServe(port, nil))
 }
