@@ -3,8 +3,10 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -254,4 +256,205 @@ func (s *TodoStore) GetStats() Stats {
 		stats.ByPriority[string(t.Priority)]++
 	}
 	return stats
+}
+
+// --- Helper
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func writeERROR(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, Response{
+		Success: false,
+		Message: msg,
+	})
+}
+
+func extractID(path string) (int, bool) {
+	// /todos/1 -> parts = ["todos", "1"]
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	id, err := strconv.Atoi(parts[1])
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return id, true
+}
+
+func isValidPriority(p Priority) bool {
+	return p == PriorityLow || p == PriorityMedium || p == PriorityHigh
+}
+
+// handlers
+
+func todoHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+
+	// GET /todos?completed=true\false
+	case http.MethodGet:
+		var filterCompleted *bool
+		if val := r.URL.Query().Get("completed"); val != "" {
+			b, err := strconv.ParseBool(val)
+			if err != nil {
+				writeERROR(w, http.StatusBadRequest, "parameter completed harus true/ false")
+				return
+			}
+			filterCompleted = &b
+		}
+		// ambil semua todo
+		todos := store.GetAll(filterCompleted)
+		if todos == nil {
+			todos = []Todo{}
+		}
+		writeJSON(w, http.StatusOK, Response{
+			Success: true,
+			Data:    todos,
+		})
+
+	// POST /todos
+	case http.MethodPost:
+		// decode body request
+		var req CreateTodoRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeERROR(w, http.StatusBadRequest, "body request tidak valid")
+			return
+		}
+		// validasi title
+		if strings.TrimSpace(req.Title) == "" {
+			writeERROR(w, http.StatusBadRequest, "field title wajib diisi")
+			return
+		}
+		// validasi priority
+		if req.Priority != "" && !isValidPriority(req.Priority) {
+			writeERROR(w, http.StatusBadRequest, "priority harus salah satu dari: low/medium/high")
+			return
+		}
+
+		// buat todo baru
+		todo, err := store.Create(req)
+		if err != nil {
+			writeERROR(w, http.StatusInternalServerError, "gagal menyimpan data ke file")
+			return
+		}
+		writeJSON(w, http.StatusOK, Response{
+			Success: true,
+			Message: "todo berhasil dibuat",
+			Data:    todo,
+		})
+	default:
+		writeERROR(w, http.StatusMethodNotAllowed, "method tidak didukung")
+	}
+}
+
+func todoByIDHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/todos/stats" {
+		statsHandler(w, r)
+		return
+	}
+
+	id, ok := extractID(r.URL.Path)
+	if !ok {
+		writeERROR(w, http.StatusBadRequest, "id tidak valid")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		todo, found := store.GetByID(id)
+		if !found {
+			writeERROR(w, http.StatusNotFound, "todo tidak ditemukan")
+			return
+		}
+		writeJSON(w, http.StatusOK, Response{
+			Success: true,
+			Data:    todo,
+		})
+
+	case http.MethodPut:
+		var req UpdateTodoRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeERROR(w, http.StatusBadRequest, "body request tidak valid")
+			return
+		}
+
+		if req.Title == nil && req.Completed == nil && req.Priority == nil {
+			writeERROR(w, http.StatusBadRequest, "kirim minimal 1 filed untuk update")
+			return
+		}
+		if req.Title != nil && strings.TrimSpace(*req.Title) == "" {
+			writeERROR(w, http.StatusBadRequest, "field title tidak boleh kosong")
+			return
+		}
+
+		if req.Priority != nil && !isValidPriority(*req.Priority) {
+			writeERROR(w, http.StatusBadRequest, "priority harus salah satu dari: low/medium/high")
+			return
+		}
+
+		// update todo
+		todo, found, err := store.Update(id, req)
+		if err != nil {
+			writeERROR(w, http.StatusInternalServerError, "gagal update todo")
+			return
+		}
+		if !found {
+			writeERROR(w, http.StatusNotFound, "todo tidak ditemukan")
+			return
+		}
+		writeJSON(w, http.StatusOK, Response{
+			Success: true,
+			Message: "todo berhasil diupdate",
+			Data:    todo,
+		})
+	case http.MethodDelete:
+		deleted, err := store.Delete(id)
+		if err != nil {
+			writeERROR(w, http.StatusInternalServerError, "gagal menyimpan data ke file")
+			return
+		}
+
+		if !deleted {
+			writeERROR(w, http.StatusNotFound, "todo tidak ditemukan")
+			return
+		}
+		writeJSON(w, http.StatusOK, Response{
+			Success: true,
+			Message: "todo berhasil dihapus",
+		})
+	default:
+		writeERROR(w, http.StatusMethodNotAllowed, "method tidak didukung")
+	}
+
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeERROR(w, http.StatusMethodNotAllowed, "method tidak didukung")
+		return
+	}
+	writeJSON(w, http.StatusOK, Response{
+		Success: true,
+		Data:    store.GetStats(),
+	})
+}
+
+func main() {
+	// load data dari server saat pertama kali direstat
+	if err := store.load(); err != nil {
+		log.Fatalf("gagal membaca file %v", err)
+	}
+
+	http.HandleFunc("/todos", todoHandler)
+	http.HandleFunc("/todos/{id}", todoByIDHandler)
+
+	port := ":8080"
+	log.Printf("server berjalan di port %s", port)
+	if err := http.ListenAndServe(port, nil); err != nil {
+		log.Fatalf("gagal menjalankan server %v", err)
+	}
+
 }
