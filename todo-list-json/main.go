@@ -14,7 +14,10 @@ import (
 
 // konstanta
 
-const dataFile = "todos.json"
+const (
+	dataFile   = "todos.json"
+	backupFile = "todos.backup.json"
+)
 
 // struct
 
@@ -27,23 +30,26 @@ const (
 )
 
 type Todo struct {
-	ID        int       `json:"id"`
-	Title     string    `json:"title"`
-	Completed bool      `json:"completed"`
-	Priority  Priority  `json:"priority"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        int        `json:"id"`
+	Title     string     `json:"title"`
+	Completed bool       `json:"completed"`
+	Priority  Priority   `json:"priority"`
+	DueDate   *time.Time `json:"due_date,omitempty"` // opsional bisa nil
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 type CreateTodoRequest struct {
 	Title    string   `json:"title"`
 	Priority Priority `json:"priority"`
+	DueDate  string   `json:"due_date"`
 }
 
 type UpdateTodoRequest struct {
 	Title     *string   `json:"title"`
 	Completed *bool     `json:"completed"`
 	Priority  *Priority `json:"priority"`
+	DueDate   *string   `json:"due_date"`
 }
 
 type Response struct {
@@ -56,6 +62,7 @@ type Stats struct {
 	Total      int            `json:"total"`
 	Completed  int            `json:"completed"`
 	Pending    int            `json:"pending"`
+	Overdue    int            `json:"overdue"`
 	ByPriority map[string]int `json:"by_priority"`
 }
 
@@ -127,20 +134,37 @@ func (s *TodoStore) save() error {
 	}
 
 	// os.WriteFile akan membuat file baru dan menimpa file lama
-	return os.WriteFile(dataFile, data, 0644)
+	if err := os.WriteFile(dataFile, data, 0644); err != nil {
+		return err
+	}
+	// backup otomatis salinan data ke file backup
+	if err := os.WriteFile(backupFile, data, 0644); err != nil {
+		log.Printf("WARNING: gagal backup: %v", err)
+	} else {
+		log.Printf("backup berhasil")
+	}
+	return nil
 }
 
 // CRUD Method
 
-func (s *TodoStore) GetAll(completedFilter *bool) []Todo {
+func (s *TodoStore) GetAll(completedFilter *bool, overdueOnly bool) []Todo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	list := make([]Todo, 0, len(s.todos))
+	now := time.Now()
 	for _, t := range s.todos {
 		if completedFilter != nil && t.Completed != *completedFilter {
 			continue
 		}
+		// filter overdue
+		if overdueOnly {
+			if t.DueDate == nil || t.Completed || !now.After(*t.DueDate) {
+				continue
+			}
+		}
+
 		list = append(list, t)
 	}
 	// selalu urutkan berdasarkan id
@@ -179,6 +203,17 @@ func (s *TodoStore) Create(req CreateTodoRequest) (Todo, error) {
 		UpdatedAt: now,
 	}
 
+	// parse due_date kalau diisi
+
+	if req.DueDate != "" {
+		parsed, err := time.Parse("2006-01-02", req.DueDate)
+		if err != nil {
+			return Todo{}, &ValidationError{"format due date salah gunakan format YYYY-MM-DD"}
+		}
+		endOfDay := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 23, 59, 59, 0, time.Local)
+		todo.DueDate = &endOfDay
+	}
+
 	s.todos[s.counter] = todo
 	// simpan ke file tiap kali ada perubhan
 	if err := s.save(); err != nil {
@@ -207,6 +242,18 @@ func (s *TodoStore) Update(id int, req UpdateTodoRequest) (Todo, bool, error) {
 	if req.Priority != nil {
 		t.Priority = *req.Priority
 	}
+	if req.DueDate != nil {
+		if *req.DueDate == "" {
+			t.DueDate = nil
+		} else {
+			parsed, err := time.Parse("2006-01-02", *req.DueDate)
+			if err != nil {
+				return Todo{}, true, &ValidationError{"format due date salah gunakan format YYYY-MM-DD"}
+			}
+			endOfDay := time.Date(parsed.Year(), parsed.Month(), parsed.Day(), 23, 59, 59, 0, time.Local)
+			t.DueDate = &endOfDay
+		}
+	}
 
 	t.UpdatedAt = time.Now()
 	s.todos[id] = t
@@ -234,11 +281,39 @@ func (s *TodoStore) Delete(id int) (bool, error) {
 	return true, nil
 }
 
+// Completed All - menandai semua todo yang belum selesai menjadi selesai
+
+func (s *TodoStore) CompletedAll() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now()
+	count := 0
+	// loop semua todo
+	for id, t := range s.todos {
+		if !t.Completed {
+			t.Completed = true
+			t.UpdatedAt = now
+			s.todos[id] = t
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, nil
+	}
+	// simpan perubahan ke file
+	if err := s.save(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
 // stats
 func (s *TodoStore) GetStats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now()
 	stats := Stats{
 		ByPriority: map[string]int{
 			"low":    0,
@@ -252,10 +327,24 @@ func (s *TodoStore) GetStats() Stats {
 			stats.Completed++
 		} else {
 			stats.Pending++
+			// hitung overdue: belum selesai dan sudah lewat tenggat
+			if t.DueDate != nil && now.After(*t.DueDate) {
+				stats.Overdue++
+			}
 		}
 		stats.ByPriority[string(t.Priority)]++
 	}
 	return stats
+}
+
+// -- Custom error
+
+type ValidationError struct {
+	msg string
+}
+
+func (e *ValidationError) Error() string {
+	return e.msg
 }
 
 // --- Helper
@@ -306,8 +395,10 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			filterCompleted = &b
 		}
+
+		overdueOnly := r.URL.Query().Get("overdue") == "true"
 		// ambil semua todo
-		todos := store.GetAll(filterCompleted)
+		todos := store.GetAll(filterCompleted, overdueOnly)
 		if todos == nil {
 			todos = []Todo{}
 		}
@@ -352,9 +443,17 @@ func todoHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func todoByIDHandler(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == "/todos/stats" {
+	// if r.URL.Path == "/todos/stats" {
+	// 	statsHandler(w, r)
+	// 	return
+	// }
+
+	switch r.URL.Path {
+	case "/todos/stats":
 		statsHandler(w, r)
 		return
+	case "/todos/complete-all":
+		completedAllHandler(w, r)
 	}
 
 	id, ok := extractID(r.URL.Path)
@@ -431,6 +530,28 @@ func todoByIDHandler(w http.ResponseWriter, r *http.Request) {
 
 }
 
+// completed all handler
+func completedAllHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		writeERROR(w, http.StatusMethodNotAllowed, "method tidak didukung")
+		return
+	}
+	count, err := store.CompletedAll()
+	if err != nil {
+		writeERROR(w, http.StatusInternalServerError, "gagal menyimpan data")
+		return
+	}
+	msg := "semua todo sudah ditandai"
+	if count > 0 {
+		msg = strconv.Itoa(count) + "todo berhasil ditandai selesai"
+	}
+	writeJSON(w, http.StatusOK, Response{
+		Success: true,
+		Message: msg,
+		Data:    map[string]int{"updated": count},
+	})
+}
+
 func statsHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeERROR(w, http.StatusMethodNotAllowed, "method tidak didukung")
@@ -449,7 +570,7 @@ func main() {
 	}
 
 	http.HandleFunc("/todos", todoHandler)
-	http.HandleFunc("/todos/{id}", todoByIDHandler)
+	http.HandleFunc("/todos/", todoByIDHandler)
 
 	port := ":8080"
 	log.Printf("server berjalan di port %s", port)
