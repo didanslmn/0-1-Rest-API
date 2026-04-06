@@ -35,7 +35,7 @@ func main() {
 	// router
 	mux := http.NewServeMux()
 
-	// user routes (public)
+	// Auth routes (public)
 	mux.HandleFunc("POST /register", userHandler.Register)
 	mux.HandleFunc("POST /login", userHandler.Login)
 
@@ -44,12 +44,14 @@ func main() {
 	mux.HandleFunc("GET /product/{id}", productHandler.GetProductByID)
 
 	// product routes (private)
+	mux.Handle("GET /product/me", Middleware.Auth(productHandler.GetMyProduct))
 	mux.Handle("POST /product", Middleware.Auth(productHandler.CreateProduct))
 	mux.Handle("PUT /product/{id}", Middleware.Auth(productHandler.UpdateProduct))
 	mux.Handle("DELETE /product/{id}", Middleware.Auth(productHandler.DeleteProduct))
 
+	loggedMux := Middleware.Logger(mux)
 	fmt.Println("Server berjalan di port 8080")
-	if err := http.ListenAndServe(":8080", mux); err != nil {
+	if err := http.ListenAndServe(":8080", loggedMux); err != nil {
 		fmt.Println("Gagal menjalankan server", err)
 	}
 }

@@ -20,15 +20,60 @@ func NewProductHandler(productRepo *repository.ProductRepository) *ProductHandle
 	return &ProductHandler{ProductRepo: productRepo}
 }
 
+// helper --
+func parsePagination(r *http.Request) (page, limit int) {
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+	limit, err = strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 || limit > 100 {
+		limit = 10
+	}
+	return page, limit
+}
+
 // GET /products
 func (h *ProductHandler) GetAllProducts(w http.ResponseWriter, r *http.Request) {
 	filter := models.ProdyctFilter{
 		Category: r.URL.Query().Get("category"),
 		MaxPrice: r.URL.Query().Get("max_price"),
 		MinPrice: r.URL.Query().Get("min_price"),
+		Search:   r.URL.Query().Get("search"),
 	}
 
-	product, err := h.ProductRepo.GetAll(r.Context(), filter)
+	page, limit := parsePagination(r)
+
+	product, err := h.ProductRepo.GetAll(r.Context(), filter, page, limit)
+	if err != nil {
+		http.Error(w, "error saat mengambil data produk", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]any{
+		"message": "data produk berhasil diambil",
+		"data":    product,
+	})
+}
+
+// GET /prodict/me
+func (h *ProductHandler) GetMyProduct(w http.ResponseWriter, r *http.Request) {
+	claims, ok := middleware.GetClaims(r)
+	if !ok {
+		http.Error(w, "user tidak terautentikasi", http.StatusUnauthorized)
+		return
+	}
+	filter := models.ProdyctFilter{
+		UserID:   claims.UserID,
+		Category: r.URL.Query().Get("category"),
+		Search:   r.URL.Query().Get("search"),
+	}
+
+	page, limit := parsePagination(r)
+
+	product, err := h.ProductRepo.GetAll(r.Context(), filter, page, limit)
 	if err != nil {
 		http.Error(w, "error saat mengambil data produk", http.StatusInternalServerError)
 		return

@@ -34,4 +34,18 @@ type ProdyctFilter struct {
 	Category string
 	MinPrice string
 	MaxPrice string
+	Search   string
+	UserID   int
+}
+
+type PaginationMeta struct {
+	TotalItems int `json:"total_items"`
+	TotalPages int `json:"total_pages"`
+	Page       int `json:"page"`
+	Limit      int `json:"limit"`
+}
+
+type PaginationProduct struct {
+	Items      []Product      `json:"items"`
+	Pagination PaginationMeta `json:"pagination"`
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"strings"
 	"toko-produk/models"
 
@@ -32,47 +33,92 @@ func scanProduct(row interface{ Scan(dest ...any) error }) (models.Product, erro
 	return p, nil
 }
 
-func (r *ProductRepository) GetAll(ctx context.Context, filter models.ProdyctFilter) ([]models.Product, error) {
-	query := "SELECT id, name, description, price, stock, category, created_by, created_at, updated_at FROM products WHERE 1=1"
+func buildWhereClause(filter models.ProdyctFilter) (string, []any) {
+	condition := []string{"1=1"}
 	args := []any{}
 	argIndex := 1
 
 	if filter.Category != "" {
-		query += fmt.Sprintf(" AND LOWER(category) = $%d", argIndex)
+		condition = append(condition, fmt.Sprintf("LOWER(category) = $%d", argIndex))
 		args = append(args, strings.ToLower(filter.Category))
 		argIndex++
 	}
 
 	if filter.MinPrice != "" {
-		query += fmt.Sprintf(" AND price >= $%d::numeric", argIndex)
+		condition = append(condition, fmt.Sprintf("price >= $%d::numeric", argIndex))
 		args = append(args, filter.MinPrice)
 		argIndex++
 	}
 
 	if filter.MaxPrice != "" {
-		query += fmt.Sprintf(" AND price <= $%d::numeric", argIndex)
+		condition = append(condition, fmt.Sprintf("price <= $%d::numeric", argIndex))
 		args = append(args, filter.MaxPrice)
 		argIndex++
 	}
 
-	query += " ORDER BY id"
+	if filter.Search != "" {
+		condition = append(condition, fmt.Sprintf("LOWER(name) LIKE $%d", argIndex))
+		args = append(args, "%"+strings.ToLower(filter.Search)+"%")
+		argIndex++
+	}
 
+	if filter.UserID != 0 {
+		condition = append(condition, fmt.Sprintf("created_by = $%d", argIndex))
+		args = append(args, filter.UserID)
+		argIndex++
+	}
+
+	return strings.Join(condition, " AND "), args
+}
+
+func (r *ProductRepository) GetAll(ctx context.Context, filter models.ProdyctFilter, page, limit int) (models.PaginationProduct, error) {
+	where, args := buildWhereClause(filter)
+
+	var totalItems int
+	countQuery := "SELECT count(*) FROM products WHERE " + where
+	err := r.DB.QueryRow(ctx, countQuery, args...).Scan(&totalItems)
+	if err != nil {
+		return models.PaginationProduct{}, err
+	}
+	totalPages := int(math.Ceil(float64(totalItems) / float64(limit)))
+	if totalPages == 0 {
+		totalPages = 1
+	}
+
+	// tambahkan limit dan offset ke args
+	args = append(args, limit)
+	args = append(args, (page-1)*limit)
+
+	query := fmt.Sprintf(`
+		SELECT id, name, description, price, stock, category, created_by, created_at, updated_at FROM products WHERE %s LIMIT $%d OFFSET $%d
+	`, where, len(args)-1, len(args))
 	rows, err := r.DB.Query(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return models.PaginationProduct{}, err
 	}
 	defer rows.Close()
 
 	products := []models.Product{}
 	for rows.Next() {
-		product, err := scanProduct(rows)
+		p, err := scanProduct(rows)
 		if err != nil {
-			return nil, err
+			return models.PaginationProduct{}, err
 		}
-		products = append(products, product)
+		products = append(products, p)
+	}
+	if err != nil {
+		return models.PaginationProduct{}, err
 	}
 
-	return products, nil
+	return models.PaginationProduct{
+		Items: products,
+		Pagination: models.PaginationMeta{
+			TotalItems: totalItems,
+			TotalPages: totalPages,
+			Page:       page,
+			Limit:      limit,
+		},
+	}, nil
 }
 
 func (r *ProductRepository) GetByID(ctx context.Context, id int) (models.Product, error) {
