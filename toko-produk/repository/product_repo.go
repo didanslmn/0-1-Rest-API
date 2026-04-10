@@ -8,14 +8,20 @@ import (
 	"strings"
 	"toko-produk/models"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 type ProductRepository struct {
-	DB *pgxpool.Pool
+	DB PgxPool
+}
+type PgxPool interface {
+	Query(ctx context.Context, query string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, query string, args ...any) pgx.Row
+	Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error)
 }
 
-func NewProductRepository(db *pgxpool.Pool) *ProductRepository {
+func NewProductRepository(db PgxPool) *ProductRepository {
 	return &ProductRepository{DB: db}
 }
 
@@ -105,8 +111,9 @@ func (r *ProductRepository) GetAll(ctx context.Context, filter models.ProdyctFil
 			return models.PaginationProduct{}, err
 		}
 		products = append(products, p)
+
 	}
-	if err != nil {
+	if err := rows.Err(); err != nil {
 		return models.PaginationProduct{}, err
 	}
 

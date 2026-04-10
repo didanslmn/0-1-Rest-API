@@ -1,22 +1,21 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"toko-produk/db"
 	"toko-produk/handler"
 	Middleware "toko-produk/middleware"
 	"toko-produk/repository"
-
-	"github.com/joho/godotenv"
 )
 
 func main() {
 	// load .env
-	if err := godotenv.Load(); err != nil {
-		fmt.Println("Gagal load .env", err)
-		return
-	}
+	// if err := godotenv.Load(); err != nil {
+	// 	fmt.Println("Gagal load .env", err)
+	// 	return
+	// }
 	// panggil function connect
 	pool, err := db.Connect()
 	if err != nil {
@@ -48,6 +47,23 @@ func main() {
 	mux.Handle("POST /product", Middleware.Auth(productHandler.CreateProduct))
 	mux.Handle("PUT /product/{id}", Middleware.Auth(productHandler.UpdateProduct))
 	mux.Handle("DELETE /product/{id}", Middleware.Auth(productHandler.DeleteProduct))
+
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		// Cek koneksi database juga
+		if err := pool.Ping(r.Context()); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "unhealthy",
+				"reason": "database tidak merespons",
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{
+			"status": "healthy",
+		})
+	})
 
 	loggedMux := Middleware.Logger(mux)
 	fmt.Println("Server berjalan di port 8080")
